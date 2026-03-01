@@ -355,6 +355,7 @@ Metrics tracked per epoch: training loss, validation loss, training accuracy, va
 **Finding:** The smaller model generalises better on this small dataset. The larger model has too many parameters relative to training examples and shows higher validation loss despite lower training loss — a sign of overfitting.
 
 **Note on accuracy:** Token-level accuracy on a large vocabulary (~3000 tokens) is expected to be low. The retrieval system compensates for this at inference time, where factual accuracy on the 10 sample questions is 100%.
+![alt text](image-5.png)
 
 ---
 

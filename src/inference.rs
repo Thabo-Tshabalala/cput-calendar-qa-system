@@ -1,10 +1,10 @@
 //! Inference module: answers questions by searching actual document content.
 //!
 //! Strategy:
-//!   1. Parse the question into keywords
-//!   2. Find the keyword in the raw document text and extract surrounding context
-//!   3. Score windows by keyword density + domain bonuses
-//!   4. If a trained Q&A pair closely matches, show it alongside document evidence
+//!   1. Parse question into keywords
+//!   2. Find keywords in raw .docx text, score windows around each hit
+//!   3. Extract only relevant day-segments from the best window
+//!   4. Fall back to trained Q&A pairs when confidence is high
 
 use crate::tokenizer::SimpleTokenizer;
 use crate::training::ModelCheckpoint;
@@ -17,23 +17,26 @@ pub fn answer_question(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let json = fs::read_to_string(checkpoint_path)
         .map_err(|e| format!("Could not read '{}': {}", checkpoint_path, e))?;
-
     let checkpoint: ModelCheckpoint =
         serde_json::from_str(&json).map_err(|e| format!("Invalid checkpoint: {}", e))?;
-
     let _tokenizer = SimpleTokenizer::load(&checkpoint.tokenizer_path).ok();
-
     Ok(answer_from_documents(question, &checkpoint))
 }
 
-/// Core QA: search documents first, trained answers second
 fn answer_from_documents(question: &str, checkpoint: &ModelCheckpoint) -> String {
-    let doc_result = search_documents(question, checkpoint);
+    let keywords: Vec<String> = question
+        .to_lowercase()
+        .split_whitespace()
+        .filter(|w| w.len() > 2 && !is_stopword(w))
+        .map(|w| w.to_string())
+        .collect();
+
+    let doc_result = search_documents(question, &keywords, checkpoint);
     let trained_result = retrieve_trained_answer(question, checkpoint);
 
     match (doc_result, trained_result) {
         (Some((file, passage, doc_score)), Some((trained_ans, qa_score))) => {
-            if qa_score >= 0.60 {
+            if qa_score >= 0.40 {
                 format!(
                     "Answer: {}\n\nDocument Evidence [{} | relevance: {:.2}]:\n  \"{}\"",
                     trained_ans, file, doc_score, passage
@@ -46,10 +49,7 @@ fn answer_from_documents(question: &str, checkpoint: &ModelCheckpoint) -> String
             }
         }
         (Some((file, passage, doc_score)), None) => {
-            format!(
-                "Answer (from {}): {}\n\n[relevance: {:.2}]",
-                file, passage, doc_score
-            )
+            format!("Answer (from {}): {}\n\n[relevance: {:.2}]", file, passage, doc_score)
         }
         (None, Some((trained_ans, _))) => {
             format!("{}\n\n[Based on training data]", trained_ans)
@@ -60,103 +60,143 @@ fn answer_from_documents(question: &str, checkpoint: &ModelCheckpoint) -> String
     }
 }
 
-/// PRIMARY: search raw document text for tight windows around keywords
+/// Search raw document text: find keyword positions, score tight windows,
+/// then extract only the relevant day-segments from the best window.
 fn search_documents(
     question: &str,
+    keywords: &[String],
     checkpoint: &ModelCheckpoint,
 ) -> Option<(String, String, f64)> {
     let q_lower = question.to_lowercase();
     let q_tokens = tokenize_words(&q_lower);
-
-    let keywords: Vec<String> = q_lower
-        .split_whitespace()
-        .filter(|w| w.len() > 2 && !is_stopword(w))
-        .map(|w| w.to_string())
-        .collect();
 
     if keywords.is_empty() {
         return None;
     }
 
     let mut best_file = String::new();
-    let mut best_passage = String::new();
+    let mut best_window = String::new();
     let mut best_score = 0.0f64;
 
     for doc in &checkpoint.documents {
         let content = &doc.content;
         let content_lower = content.to_lowercase();
 
-        // Strategy: find each keyword in the document, score a window around it
-        for kw in &keywords {
+        for kw in keywords {
             if kw.len() < 3 { continue; }
             let mut search_start = 0usize;
-            while let Some(rel_pos) = content_lower[search_start..].find(kw.as_str()) {
-                let abs_pos = search_start + rel_pos;
+            while search_start < content_lower.len() {
+                match content_lower[search_start..].find(kw.as_str()) {
+                    None => break,
+                    Some(rel_pos) => {
+                        let abs_pos = search_start + rel_pos;
+                        let start = snap_word_start(content, abs_pos.saturating_sub(200));
+                        let end = snap_word_end(content, (abs_pos + 350).min(content.len()));
+                        let window = &content[start..end];
+                        let w_lower = window.to_lowercase();
+                        let w_tokens = tokenize_words(&w_lower);
 
-                // Extract a 400-char window centred on the keyword hit
-                let start = abs_pos.saturating_sub(150);
-                let end = (abs_pos + 250).min(content.len());
+                        let mut score = jaccard(&q_tokens, &w_tokens);
+                        let hits = keywords.iter().filter(|k| w_lower.contains(k.as_str())).count();
+                        score += (hits as f64 * 0.18).min(0.72);
+                        score += calendar_keyword_bonus(&q_lower, &w_lower);
+                        // Prefer documents whose filename matches the year in the question
+                        if q_lower.contains("2026") && doc.filename.contains("2026") { score += 0.20; }
+                        if q_lower.contains("2025") && doc.filename.contains("2025") { score += 0.20; }
+                        if q_lower.contains("2024") && doc.filename.contains("2024") { score += 0.20; }
 
-                // Snap to word boundaries
-                let start = snap_word_start(content, start);
-                let end = snap_word_end(content, end);
+                        if score > best_score {
+                            best_score = score;
+                            best_file = doc.filename.clone();
+                            best_window = window.to_string();
+                        }
 
-                let window = content[start..end].to_string();
-                let w_lower = window.to_lowercase();
-                let w_tokens = tokenize_words(&w_lower);
-
-                let mut score = jaccard(&q_tokens, &w_tokens);
-                let hits = keywords.iter().filter(|k| w_lower.contains(k.as_str())).count();
-                score += (hits as f64 * 0.18).min(0.72);
-                score += calendar_keyword_bonus(&q_lower, &w_lower);
-
-                if score > best_score {
-                    best_score = score;
-                    best_file = doc.filename.clone();
-                    best_passage = window.trim().to_string();
+                        search_start = abs_pos + 1;
+                    }
                 }
-
-                search_start = abs_pos + 1;
-                if search_start >= content_lower.len() { break; }
             }
         }
     }
 
-    if best_score >= 0.25 && !best_passage.is_empty() {
-        Some((best_file, clean_passage(&best_passage, 300), best_score))
+    if best_score >= 0.25 && !best_window.is_empty() {
+        // Extract only the day-segments that contain our keywords
+        let focused = extract_relevant_segments(&best_window, keywords);
+        Some((best_file, focused, best_score))
     } else {
         None
     }
 }
 
-/// Snap index to start of nearest word
-fn snap_word_start(text: &str, pos: usize) -> usize {
-    let bytes = text.as_bytes();
-    let mut i = pos;
-    while i < bytes.len() && bytes[i] != b' ' && i > 0 {
-        i -= 1;
+/// Split a calendar text window into day-segments and keep only
+/// the ones that contain at least one query keyword.
+///
+/// Calendar text looks like:
+///   "... 17 Senate (12:00) 18 Research Festival Day 1 19 Research Festival Day 2 ..."
+/// We split on standalone day numbers (1-31) and keep segments with keywords.
+fn extract_relevant_segments(window: &str, keywords: &[String]) -> String {
+    let words: Vec<&str> = window.split_whitespace().collect();
+    let mut segments: Vec<Vec<&str>> = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+
+    for word in &words {
+        let is_day = word.parse::<u32>().map(|n| n >= 1 && n <= 31).unwrap_or(false);
+        if is_day && !current.is_empty() {
+            segments.push(current.clone());
+            current.clear();
+        }
+        current.push(word);
     }
-    if bytes[i] == b' ' { i + 1 } else { i }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+
+    // Keep segments containing at least one keyword
+    let relevant: Vec<String> = segments
+        .iter()
+        .filter(|seg| {
+            let seg_text = seg.join(" ").to_lowercase();
+            keywords.iter().any(|kw| seg_text.contains(kw.as_str()))
+        })
+        .map(|seg| seg.join(" "))
+        .collect();
+
+    if relevant.is_empty() {
+        // Fall back: clean and truncate the raw window
+        let cleaned = window.split_whitespace().collect::<Vec<_>>().join(" ");
+        if cleaned.len() > 300 {
+            format!("{}...", &cleaned[..300])
+        } else {
+            cleaned
+        }
+    } else {
+        relevant.join("  |  ")
+    }
 }
 
-/// Snap index to end of nearest word
+fn snap_word_start(text: &str, pos: usize) -> usize {
+    let bytes = text.as_bytes();
+    let mut i = pos.min(bytes.len().saturating_sub(1));
+    while i > 0 && bytes[i] != b' ' {
+        i -= 1;
+    }
+    if i > 0 { i + 1 } else { 0 }
+}
+
 fn snap_word_end(text: &str, pos: usize) -> usize {
     let bytes = text.as_bytes();
-    let mut i = pos.min(bytes.len() - 1);
+    let mut i = pos.min(bytes.len());
     while i < bytes.len() && bytes[i] != b' ' {
         i += 1;
     }
-    i.min(bytes.len())
+    i
 }
 
-/// SECONDARY: match against trained Q&A pairs
 fn retrieve_trained_answer(
     question: &str,
     checkpoint: &ModelCheckpoint,
 ) -> Option<(String, f64)> {
     let q_lower = question.to_lowercase();
     let q_tokens = tokenize_words(&q_lower);
-
     let mut best_score = 0.0f64;
     let mut best_answer: Option<String> = None;
 
@@ -169,71 +209,7 @@ fn retrieve_trained_answer(
             best_answer = Some(ex.answer.clone());
         }
     }
-
     best_answer.map(|a| (a, best_score))
-}
-
-/// Split document into month-level chunks (fallback)
-fn chunk_document(text: &str, max_words: usize) -> Vec<String> {
-    let months = [
-        "JANUARY","FEBRUARY","MARCH","APRIL","MAY","JUNE",
-        "JULY","AUGUST","SEPTEMBER","OCTOBER","NOVEMBER","DECEMBER",
-    ];
-
-    let mut chunks = Vec::new();
-    let mut current_chunk = String::new();
-    let mut current_words = 0usize;
-    let words: Vec<&str> = text.split_whitespace().collect();
-
-    for word in &words {
-        let is_month = months.iter().any(|m| word.eq_ignore_ascii_case(m));
-        if is_month && current_words > 20 {
-            if !current_chunk.trim().is_empty() {
-                chunks.push(current_chunk.trim().to_string());
-            }
-            current_chunk = String::new();
-            current_words = 0;
-        }
-
-        current_chunk.push(' ');
-        current_chunk.push_str(word);
-        current_words += 1;
-
-        if current_words >= max_words {
-            chunks.push(current_chunk.trim().to_string());
-            let tail: Vec<String> = current_chunk
-                .split_whitespace()
-                .rev()
-                .take(30)
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
-            current_words = tail.len();
-            current_chunk = tail.join(" ");
-        }
-    }
-
-    if !current_chunk.trim().is_empty() {
-        chunks.push(current_chunk.trim().to_string());
-    }
-
-    if chunks.is_empty() { vec![text.to_string()] } else { chunks }
-}
-
-/// Clean up whitespace and truncate for display
-fn clean_passage(s: &str, max_chars: usize) -> String {
-    let cleaned: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if cleaned.len() <= max_chars {
-        cleaned
-    } else {
-        let cut = &cleaned[..max_chars];
-        match cut.rfind(' ') {
-            Some(last_space) => format!("{}...", &cleaned[..last_space]),
-            None => format!("{}...", cut),
-        }
-    }
 }
 
 fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
@@ -244,7 +220,7 @@ fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
 
 fn calendar_keyword_bonus(q: &str, chunk: &str) -> f64 {
     let terms = [
-        "graduation", "convocation", "research festival", "open day",
+        "graduation ceremony", "end of year graduation", "graduation", "convocation", "research festival", "open day",
         "hdc", "higher degrees", "senate", "council",
         "term 1", "term 2", "term 3", "term 4",
         "start of term", "end of term",
