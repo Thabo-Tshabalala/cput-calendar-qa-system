@@ -1,0 +1,23 @@
+# Rust build artifacts
+/target/
+
+# Model outputs
+model_checkpoint.json
+tokenizer.json
+*.ckpt
+*.bin
+
+# Temporary files
+*.log
+*.tmp
+*.bak
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
+
+# Zip files
+*.zip
