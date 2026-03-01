@@ -72,4 +72,6 @@ cargo run -- train ./data --epochs 10 --lr 0.0001 --batch-size 4
 
 cargo run -- ask model_checkpoint.json "When does Term 1 start in 2026?"
 
+
+[View the Report](docs/REPORT.md)
 ---
