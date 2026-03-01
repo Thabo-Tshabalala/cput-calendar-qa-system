@@ -1,3 +1,11 @@
+//! Inference module: answers questions by searching actual document content.
+//!
+//! Strategy:
+//!   1. Parse the question into keywords
+//!   2. Search all loaded .docx document chunks for the best matching passage
+//!   3. If a very close trained Q&A pair exists (jaccard >= 0.6), show it alongside
+//!   4. Always ground the answer in actual document text
+
 use crate::tokenizer::SimpleTokenizer;
 use crate::training::ModelCheckpoint;
 use std::collections::HashSet;
@@ -18,35 +26,111 @@ pub fn answer_question(
     Ok(answer_from_documents(question, &checkpoint))
 }
 
-/// Main inference:
-/// 1) Try to match a trained Q&A pair (high confidence = use directly)
-/// 2) Fall back to retrieving the best document chunk
+/// Core QA logic — always fetches answer from actual document text
 fn answer_from_documents(question: &str, checkpoint: &ModelCheckpoint) -> String {
-    let qa_answer = retrieve_closest_training_answer(question, checkpoint);
-    let doc_chunk = retrieve_best_doc_chunk(question, checkpoint);
+    // Step 1: Search the actual .docx document content
+    let doc_result = search_documents(question, checkpoint);
 
-    match (qa_answer, doc_chunk) {
-        (Some((ans, qa_score)), Some((file, snippet, doc_score))) => {
-            if qa_score >= 0.55 {
-                // High confidence trained answer — return it with evidence
-                format!("{}\n\n[Source: {} | confidence: {:.2}]", ans, file, doc_score)
+    // Step 2: Check if a trained Q&A pair closely matches (confidence >= 0.6)
+    let trained_result = retrieve_trained_answer(question, checkpoint);
+
+    match (doc_result, trained_result) {
+        // Both document and trained answer found
+        (Some((file, passage, doc_score)), Some((trained_ans, qa_score))) => {
+            if qa_score >= 0.60 {
+                // High-confidence trained answer — show it, backed by document evidence
+                format!(
+                    "Answer: {}\n\nDocument Evidence [{} | relevance: {:.2}]:\n  \"{}\"",
+                    trained_ans, file, doc_score, passage
+                )
             } else {
-                // Lower confidence — show doc evidence as answer
-                format!("{}\n\n[Source: {} | confidence: {:.2}]", snippet, file, doc_score)
+                // Lower confidence — show document passage as primary answer
+                format!(
+                    "Answer (from documents): {}\n\nSource: {} | relevance: {:.2}",
+                    passage, file, doc_score
+                )
             }
         }
-        (Some((ans, _)), None) => ans,
-        (None, Some((file, snippet, score))) => {
-            format!("{}\n\n[Source: {} | confidence: {:.2}]", snippet, file, score)
+        // Only document found
+        (Some((file, passage, doc_score)), None) => {
+            format!(
+                "Answer (from documents): {}\n\nSource: {} | relevance: {:.2}",
+                passage, file, doc_score
+            )
         }
+        // Only trained answer found (fallback)
+        (None, Some((trained_ans, _))) => {
+            format!("Answer: {}\n\n[Based on training data — no direct document match found]", trained_ans)
+        }
+        // Nothing found
         (None, None) => {
-            "I could not find a relevant answer in the calendar documents.".to_string()
+            "No relevant information found in the calendar documents for that question.".to_string()
         }
     }
 }
 
-/// Match question against trained Q&A pairs using Jaccard + keyword bonus
-fn retrieve_closest_training_answer(
+/// Search actual document text for the best matching passage.
+/// This is the PRIMARY answer source — real document content.
+fn search_documents(
+    question: &str,
+    checkpoint: &ModelCheckpoint,
+) -> Option<(String, String, f64)> {
+    let q_lower = question.to_lowercase();
+    let q_tokens = tokenize_words(&q_lower);
+
+    // Extract meaningful keywords from question
+    let keywords: Vec<&str> = q_lower
+        .split_whitespace()
+        .filter(|w| w.len() > 2 && !is_stopword(w))
+        .collect();
+
+    if keywords.is_empty() {
+        return None;
+    }
+
+    let mut best_file = String::new();
+    let mut best_passage = String::new();
+    let mut best_score = 0.0f64;
+
+    for doc in &checkpoint.documents {
+        // Split document into sentence-level chunks for precise retrieval
+        for chunk in chunk_document(&doc.content, 300) {
+            let c_lower = chunk.to_lowercase();
+            let c_tokens = tokenize_words(&c_lower);
+
+            // Base similarity score
+            let mut score = jaccard(&q_tokens, &c_tokens);
+
+            // Bonus for keyword hits in this chunk
+            let hits = keywords
+                .iter()
+                .filter(|&&kw| c_lower.contains(kw))
+                .count();
+            score += (hits as f64 * 0.12).min(0.65);
+
+            // Domain-specific bonuses for calendar terms
+            score += calendar_keyword_bonus(&q_lower, &c_lower);
+
+            if score > best_score {
+                best_score = score;
+                best_file = doc.filename.clone();
+                best_passage = chunk.trim().to_string();
+            }
+        }
+    }
+
+    // Only return if we found something meaningful
+    if best_score >= 0.30 && !best_passage.is_empty() {
+        // Clean up and shorten the passage for readable output
+        let clean = clean_passage(&best_passage, 250);
+        Some((best_file, clean, best_score))
+    } else {
+        None
+    }
+}
+
+/// Retrieve the closest trained Q&A answer (secondary source)
+fn retrieve_trained_answer(
     question: &str,
     checkpoint: &ModelCheckpoint,
 ) -> Option<(String, f64)> {
@@ -59,7 +143,8 @@ fn retrieve_closest_training_answer(
     for ex in &checkpoint.qa_examples {
         let ex_lower = ex.question.to_lowercase();
         let ex_tokens = tokenize_words(&ex_lower);
-        let score = jaccard(&q_tokens, &ex_tokens) + keyword_bonus(&q_lower, &ex_lower);
+        let score = jaccard(&q_tokens, &ex_tokens) + calendar_keyword_bonus(&q_lower, &ex_lower);
+
         if score > best_score {
             best_score = score;
             best_answer = Some(ex.answer.clone());
@@ -69,81 +154,59 @@ fn retrieve_closest_training_answer(
     best_answer.map(|a| (a, best_score))
 }
 
-/// Retrieve best matching chunk from raw document text
-fn retrieve_best_doc_chunk(
-    question: &str,
-    checkpoint: &ModelCheckpoint,
-) -> Option<(String, String, f64)> {
-    let q_lower = question.to_lowercase();
-    let q_tokens = tokenize_words(&q_lower);
-
-    let keywords: Vec<&str> = q_lower
-        .split_whitespace()
-        .filter(|w| w.len() > 3 && !is_stopword(w))
-        .collect();
-
-    if keywords.is_empty() {
-        return None;
-    }
-
-    let mut best_file = String::new();
-    let mut best_chunk = String::new();
-    let mut best_score = 0.0f64;
-
-    for doc in &checkpoint.documents {
-        for chunk in split_into_chunks(&doc.content, 280) {
-            let c_lower = chunk.to_lowercase();
-            let c_tokens = tokenize_words(&c_lower);
-
-            let mut score = jaccard(&q_tokens, &c_tokens);
-            let hits = keywords.iter().filter(|&&kw| c_lower.contains(kw)).count();
-            score += (hits as f64 * 0.10).min(0.60);
-            score += keyword_bonus(&q_lower, &c_lower);
-
-            if score > best_score {
-                best_score = score;
-                best_file = doc.filename.clone();
-                best_chunk = chunk.trim().to_string();
-            }
-        }
-    }
-
-    if best_score >= 0.35 && !best_chunk.is_empty() {
-        Some((best_file, shorten(&best_chunk, 220), best_score))
-    } else {
-        None
-    }
-}
-
-/// Split document text into manageable chunks for retrieval
-fn split_into_chunks(text: &str, max_len: usize) -> Vec<String> {
+/// Split document content into overlapping chunks for better retrieval coverage.
+/// Calendar text is space-separated events, so we split on whitespace boundaries.
+fn chunk_document(text: &str, max_words: usize) -> Vec<String> {
     let mut chunks = Vec::new();
 
-    for para in text.split('\n') {
-        let p = para.trim();
-        if p.is_empty() {
-            continue;
-        }
-        let mut current = String::new();
-        for part in p.split(|c| c == '.' || c == ';' || c == ':') {
-            let s = part.trim();
-            if s.is_empty() {
-                continue;
+    // First try splitting on month headings (e.g. "JANUARY 2026", "FEBRUARY 2024")
+    // which naturally segment the calendar into monthly sections
+    let months = [
+        "JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE",
+        "JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER",
+    ];
+
+    let mut current_chunk = String::new();
+    let mut current_words = 0usize;
+    let words: Vec<&str> = text.split_whitespace().collect();
+
+    let mut i = 0;
+    while i < words.len() {
+        let word = words[i];
+
+        // Detect month boundary — start new chunk
+        let is_month = months.iter().any(|m| word.eq_ignore_ascii_case(m));
+        if is_month && current_words > 20 {
+            if !current_chunk.trim().is_empty() {
+                chunks.push(current_chunk.trim().to_string());
             }
-            if current.len() + s.len() + 2 > max_len {
-                if !current.trim().is_empty() {
-                    chunks.push(current.trim().to_string());
-                }
-                current.clear();
-            }
-            if !current.is_empty() {
-                current.push_str(". ");
-            }
-            current.push_str(s);
+            current_chunk = String::new();
+            current_words = 0;
         }
-        if !current.trim().is_empty() {
-            chunks.push(current.trim().to_string());
+
+        current_chunk.push(' ');
+        current_chunk.push_str(word);
+        current_words += 1;
+
+        // Also split on max length
+        if current_words >= max_words {
+            chunks.push(current_chunk.trim().to_string());
+            // Overlap: keep last 30 words for context continuity
+            let overlap_start = current_words.saturating_sub(30);
+            let overlap_words: Vec<String> = current_chunk
+                .split_whitespace()
+                .skip(overlap_start)
+                .map(|s| s.to_string())
+                .collect();
+            current_words = overlap_words.len();
+            current_chunk = overlap_words.join(" ");
         }
+
+        i += 1;
+    }
+
+    if !current_chunk.trim().is_empty() {
+        chunks.push(current_chunk.trim().to_string());
     }
 
     if chunks.is_empty() {
@@ -153,11 +216,25 @@ fn split_into_chunks(text: &str, max_len: usize) -> Vec<String> {
     }
 }
 
-fn shorten(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
+/// Clean and shorten a passage for readable output
+fn clean_passage(s: &str, max_chars: usize) -> String {
+    // Collapse multiple spaces
+    let cleaned: String = s
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if cleaned.len() <= max_chars {
+        cleaned
+    } else {
+        // Try to cut at a word boundary
+        let cut = &cleaned[..max_chars];
+        if let Some(last_space) = cut.rfind(' ') {
+            format!("{}...", &cleaned[..last_space])
+        } else {
+            format!("{}...", cut)
+        }
     }
-    format!("{}...", &s[..max])
 }
 
 fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
@@ -166,21 +243,34 @@ fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
     if u == 0 { 0.0 } else { i as f64 / u as f64 }
 }
 
-fn keyword_bonus(q: &str, ex: &str) -> f64 {
+/// Bonus score for calendar-domain keywords appearing in both question and chunk
+fn calendar_keyword_bonus(q: &str, chunk: &str) -> f64 {
     let terms = [
-        "graduation", "convocation", "hdc", "higher degrees",
+        // Events
+        "graduation", "convocation", "research festival", "open day",
+        "hdc", "higher degrees", "senate", "council",
+        // Terms
         "term 1", "term 2", "term 3", "term 4",
+        "start of term", "end of term",
+        // Months
         "january", "february", "march", "april", "may", "june",
         "july", "august", "september", "october", "november", "december",
-        "2024", "2025", "2026", "senate", "council", "committee",
-        "research", "festival", "good friday", "heritage", "christmas",
-        "workers", "youth", "women", "freedom", "reconciliation",
-        "wced", "academic", "administrative", "open day", "ceremony",
+        // Years
+        "2024", "2025", "2026",
+        // Holidays
+        "good friday", "christmas", "heritage day", "workers day",
+        "youth day", "womens day", "freedom day", "reconciliation",
+        "human rights", "africa day", "mandela day",
+        // Academic
+        "academic staff", "administrative staff", "wced", "first year",
     ];
-    let bonus: f64 = terms.iter()
-        .filter(|&&t| q.contains(t) && ex.contains(t))
+
+    let bonus: f64 = terms
+        .iter()
+        .filter(|&&t| q.contains(t) && chunk.contains(t))
         .count() as f64 * 0.10;
-    bonus.min(0.6_f64)
+
+    bonus.min(0.60_f64)
 }
 
 fn tokenize_words(text: &str) -> HashSet<String> {
