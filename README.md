@@ -72,6 +72,7 @@ cargo run -- train ./data --epochs 10 --lr 0.0001 --batch-size 4
 
 cargo run -- ask model_checkpoint.json "When does Term 1 start in 2026?"
 
+ **Note:** The project report can be found in the `docs/` folder (`docs/REPORT.md`).
 
-[View the Report](docs/REPORT.md)
 ---
+[View the Report](docs/REPORT.md)
