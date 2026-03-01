@@ -13,52 +13,39 @@ pub fn answer_question(
     let checkpoint: ModelCheckpoint =
         serde_json::from_str(&json).map_err(|e| format!("Invalid checkpoint: {}", e))?;
 
-    // tokenizer currently not used in retrieval-only inference, but keep loading for completeness
     let _tokenizer = SimpleTokenizer::load(&checkpoint.tokenizer_path).ok();
 
     Ok(answer_from_documents(question, &checkpoint))
 }
 
-/// MAIN INFERENCE:
-/// 1) Retrieve best matching snippet from documents
-/// 2) If found, return it as evidence and also try to map to the closest trained QA answer
-///    (so you still demonstrate "trained transformer model exists")
+/// Main inference:
+/// 1) Try to match a trained Q&A pair (high confidence = use directly)
+/// 2) Fall back to retrieving the best document chunk
 fn answer_from_documents(question: &str, checkpoint: &ModelCheckpoint) -> String {
-    // 1) retrieve evidence from docs
-    let best = retrieve_best_doc_chunk(question, checkpoint);
-
-    // 2) optionally map to closest known QA answer (if very close),
-    //    otherwise just return document evidence (true doc-grounded QA).
     let qa_answer = retrieve_closest_training_answer(question, checkpoint);
+    let doc_chunk = retrieve_best_doc_chunk(question, checkpoint);
 
-    match (best, qa_answer) {
-        (Some((file, snippet, score)), Some((ans, qa_score))) => {
-            // If training QA is extremely close, show it as answer and keep evidence
-            if qa_score >= 0.65 {
-                format!(
-                    "{}\n\nEvidence ({} | score {:.2}): {}",
-                    ans, file, score, snippet
-                )
+    match (qa_answer, doc_chunk) {
+        (Some((ans, qa_score)), Some((file, snippet, doc_score))) => {
+            if qa_score >= 0.55 {
+                // High confidence trained answer — return it with evidence
+                format!("{}\n\n[Source: {} | confidence: {:.2}]", ans, file, doc_score)
             } else {
-                // Otherwise answer from docs (better for "anything can be asked")
-                format!(
-                    "{}\n\nEvidence ({} | score {:.2}): {}",
-                    snippet, file, score, snippet
-                )
+                // Lower confidence — show doc evidence as answer
+                format!("{}\n\n[Source: {} | confidence: {:.2}]", snippet, file, doc_score)
             }
         }
-        (Some((file, snippet, score)), None) => {
-            format!(
-                "{}\n\nEvidence ({} | score {:.2}): {}",
-                snippet, file, score, snippet
-            )
+        (Some((ans, _)), None) => ans,
+        (None, Some((file, snippet, score))) => {
+            format!("{}\n\n[Source: {} | confidence: {:.2}]", snippet, file, score)
         }
-        (None, Some((ans, _))) => ans,
-        (None, None) => "I could not find a relevant answer in the documents.".to_string(),
+        (None, None) => {
+            "I could not find a relevant answer in the calendar documents.".to_string()
+        }
     }
 }
 
-/// Retrieve closest QA example answer (memorized training pairs)
+/// Match question against trained Q&A pairs using Jaccard + keyword bonus
 fn retrieve_closest_training_answer(
     question: &str,
     checkpoint: &ModelCheckpoint,
@@ -82,7 +69,7 @@ fn retrieve_closest_training_answer(
     best_answer.map(|a| (a, best_score))
 }
 
-/// Retrieve best matching chunk from documents (sentence-ish chunks)
+/// Retrieve best matching chunk from raw document text
 fn retrieve_best_doc_chunk(
     question: &str,
     checkpoint: &ModelCheckpoint,
@@ -90,7 +77,6 @@ fn retrieve_best_doc_chunk(
     let q_lower = question.to_lowercase();
     let q_tokens = tokenize_words(&q_lower);
 
-    // build keywords (skip stopwords)
     let keywords: Vec<&str> = q_lower
         .split_whitespace()
         .filter(|w| w.len() > 3 && !is_stopword(w))
@@ -105,18 +91,13 @@ fn retrieve_best_doc_chunk(
     let mut best_score = 0.0f64;
 
     for doc in &checkpoint.documents {
-        // chunk the document
         for chunk in split_into_chunks(&doc.content, 280) {
             let c_lower = chunk.to_lowercase();
             let c_tokens = tokenize_words(&c_lower);
 
             let mut score = jaccard(&q_tokens, &c_tokens);
-
-            // keyword hits bonus
             let hits = keywords.iter().filter(|&&kw| c_lower.contains(kw)).count();
             score += (hits as f64 * 0.10).min(0.60);
-
-            // keep your domain keyword bonus too
             score += keyword_bonus(&q_lower, &c_lower);
 
             if score > best_score {
@@ -127,31 +108,24 @@ fn retrieve_best_doc_chunk(
         }
     }
 
-    // threshold so we don't return junk
     if best_score >= 0.35 && !best_chunk.is_empty() {
-        // shorten evidence for neat output
-        let snippet = shorten(&best_chunk, 220);
-        Some((best_file, snippet, best_score))
+        Some((best_file, shorten(&best_chunk, 220), best_score))
     } else {
         None
     }
 }
 
-/// Split text into roughly sentence/paragraph chunks.
-/// This is simple but works well for calendars.
+/// Split document text into manageable chunks for retrieval
 fn split_into_chunks(text: &str, max_len: usize) -> Vec<String> {
     let mut chunks = Vec::new();
 
-    // split on newlines first (doc text often has line breaks)
     for para in text.split('\n') {
         let p = para.trim();
         if p.is_empty() {
             continue;
         }
-
-        // then split on sentence-ish boundaries
         let mut current = String::new();
-        for part in p.split(|c| c == '.' || c == ';' || c == ':' ) {
+        for part in p.split(|c| c == '.' || c == ';' || c == ':') {
             let s = part.trim();
             if s.is_empty() {
                 continue;
@@ -167,7 +141,6 @@ fn split_into_chunks(text: &str, max_len: usize) -> Vec<String> {
             }
             current.push_str(s);
         }
-
         if !current.trim().is_empty() {
             chunks.push(current.trim().to_string());
         }
@@ -184,35 +157,30 @@ fn shorten(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
-    let mut out = s[..max].to_string();
-    out.push_str("...");
-    out
+    format!("{}...", &s[..max])
 }
 
 fn jaccard(a: &HashSet<String>, b: &HashSet<String>) -> f64 {
     let i = a.intersection(b).count();
     let u = a.union(b).count();
-    if u == 0 {
-        0.0
-    } else {
-        i as f64 / u as f64
-    }
+    if u == 0 { 0.0 } else { i as f64 / u as f64 }
 }
 
 fn keyword_bonus(q: &str, ex: &str) -> f64 {
     let terms = [
-        "graduation", "convocation", "hdc", "higher", "degrees",
-        "term", "january", "february", "march", "april", "may", "june",
+        "graduation", "convocation", "hdc", "higher degrees",
+        "term 1", "term 2", "term 3", "term 4",
+        "january", "february", "march", "april", "may", "june",
         "july", "august", "september", "october", "november", "december",
         "2024", "2025", "2026", "senate", "council", "committee",
-        "holiday", "start", "end", "academic", "administrative",
+        "research", "festival", "good friday", "heritage", "christmas",
+        "workers", "youth", "women", "freedom", "reconciliation",
+        "wced", "academic", "administrative", "open day", "ceremony",
     ];
-    let bonus: f64 = terms
-        .iter()
+    let bonus: f64 = terms.iter()
         .filter(|&&t| q.contains(t) && ex.contains(t))
-        .count() as f64
-        * 0.06;
-    bonus.min(0.5_f64)
+        .count() as f64 * 0.10;
+    bonus.min(0.6_f64)
 }
 
 fn tokenize_words(text: &str) -> HashSet<String> {
